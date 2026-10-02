@@ -1,0 +1,5 @@
+/target
+
+# Local IDE settings
+/.idea
+.mcp.json

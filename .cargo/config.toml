@@ -1,0 +1,5 @@
+# Release builds of GPUI compile their DirectX shaders with fxc.exe from the
+# Windows SDK. GPUI only looks in the SDK 10.0.26100 folder by default, so we
+# point it at the SDK version installed on this machine.
+[env]
+GPUI_FXC_PATH = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.19041.0\x64\fxc.exe'
