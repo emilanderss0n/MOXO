@@ -2,7 +2,7 @@
 
 A lightweight, offline-first image editor for Windows, written in Rust with [GPUI](https://www.gpui.rs/).
 
-Early days: right now it only opens an empty window.
+Early days: right now it can open and view PNG and JPEG images (File › Open Image…, or Ctrl+O).
 
 ## Building on Windows
 

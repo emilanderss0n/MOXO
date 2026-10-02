@@ -5,3 +5,19 @@ edition = "2024"
 
 [dependencies]
 gpui = "0.2.2"
+# Decodes PNG and JPEG files. GPUI already uses this crate, so it adds no extra build time.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Native Windows file picker with file-type filters (GPUI's own picker has none).
+rfd = "0.17"
+# Lets us pass Moxo's window to rfd as the dialog's parent. Already used by GPUI and rfd.
+raw-window-handle = "0.6"
+
+# Debug builds normally skip optimisation entirely, which makes pixel work
+# painfully slow (a 48-megapixel JPEG took 17 seconds to open). Fully optimise
+# the libraries we depend on, and lightly optimise Moxo's own code so it still
+# compiles quickly and works with the debugger.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
