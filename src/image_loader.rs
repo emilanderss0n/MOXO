@@ -7,6 +7,8 @@ use std::sync::Arc;
 use gpui::RenderImage;
 use image::{DynamicImage, Frame, ImageDecoder, ImageError, ImageFormat, ImageReader};
 
+use crate::APP_NAME;
+
 // GPUI can't upload an image larger than this on either side to the GPU.
 const MAX_SIDE: u32 = 16384;
 
@@ -34,7 +36,7 @@ pub fn load(path: &Path) -> Result<LoadedImage, String> {
     let (width, height) = decoder.dimensions();
     if width > MAX_SIDE || height > MAX_SIDE {
         return Err(format!(
-            "it's {width} × {height} px, and Moxo can only show images up to {MAX_SIDE} px on each side"
+            "it's {width} × {height} px, and {APP_NAME} can only show images up to {MAX_SIDE} px on each side"
         ));
     }
 
@@ -258,7 +260,9 @@ mod tests {
         RgbaImage::new(MAX_SIDE + 1, 1).save(&wide.0).unwrap();
         assert_eq!(
             load_error(&wide.0),
-            "it's 16385 × 1 px, and Moxo can only show images up to 16384 px on each side"
+            format!(
+                "it's 16385 × 1 px, and {APP_NAME} can only show images up to 16384 px on each side"
+            )
         );
 
         let tall = TempFile::new("too-tall.png");

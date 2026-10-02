@@ -20,6 +20,11 @@ use gpui::{
 use navigation::{PanDrag, ScrollAction};
 use viewport::Viewport;
 
+// The product's display name, shown in window titles and messages. It's
+// provisional: to rename the product, change it here rather than in
+// individual strings. (Technical names like the Cargo package stay as they are.)
+const APP_NAME: &str = "Moxo";
+
 actions!(moxo, [OpenImage, ZoomIn, ZoomOut, FitOnScreen, ActualSize]);
 
 // Colours for the dark theme.
@@ -147,7 +152,7 @@ impl Moxo {
                         if let Some(previous) = this.opened.take() {
                             cx.drop_image(previous.image, Some(window));
                         }
-                        window.set_window_title(&format!("{file_name} - Moxo"));
+                        window.set_window_title(&format!("{file_name} - {APP_NAME}"));
                         this.error = None;
                         this.opened = Some(OpenedImage {
                             file_name,
@@ -616,7 +621,7 @@ fn main() {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("Moxo".into()),
+                    title: Some(APP_NAME.into()),
                     ..Default::default()
                 }),
                 ..Default::default()

@@ -62,6 +62,18 @@ Clippy currently reports one known warning (`manual_is_multiple_of` in
 - A test that needs a real window must be `#[ignore]` and run only when asked.
 - Reports list anything that still needs checking by hand in the app.
 
+## Product name
+- "Moxo" is a provisional display name. Anything users see (window titles,
+  messages, UI text) must get it from `APP_NAME` in `src/main.rs`; never
+  hardcode it in a new string.
+- Technical identifiers that contain the name stay as they are: the Cargo
+  package and binary `moxo` (so `moxo.exe`), the `Moxo` view type, the `moxo`
+  action namespace, file and module names, and the repository. Renaming those
+  is a separate, deliberate task.
+- To rename the product: change `APP_NAME`, then deliberately update the
+  README and CLAUDE.md titles, code comments that name the app, and any
+  branding assets or Windows file metadata (icon, version info) once they exist.
+
 ## Conventions
 - Simple, readable Rust. The main developer knows PHP/JavaScript well and is
   newer to Rust, so briefly explain Rust-specific ideas when they come up,
