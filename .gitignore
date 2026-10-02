@@ -2,8 +2,3 @@
 
 # Local IDE settings
 /.idea
-.mcp.json
-
-# Personal Claude Code settings and notes (the shared ones are committed)
-.claude/settings.local.json
-CLAUDE.local.md
