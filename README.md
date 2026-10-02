@@ -2,17 +2,31 @@
 
 A lightweight, offline-first image editor for Windows, written in Rust with [GPUI](https://www.gpui.rs/).
 
-The goal is a focused editor for everyday image editing, not a full Photoshop clone. Early days: right now it can open PNG and JPEG images and zoom and pan around them.
+The goal is a focused editor for everyday image editing, not a full Photoshop clone. Early days: right now it can open PNG and JPEG images, zoom and pan around them, rotate and flip them with undo and redo, and save them as PNG or JPEG.
 
 ## Controls
 
 | Action | Shortcut |
 |---|---|
 | Open an image | Ctrl+O |
+| Save | Ctrl+S |
+| Save As | Ctrl+Shift+S |
+| Undo / redo | Ctrl+Z / Ctrl+Y (or Ctrl+Shift+Z) |
+| Rotate 90° clockwise or counter-clockwise, flip horizontally or vertically | Image menu |
 | Zoom in / out | Ctrl++ / Ctrl+- (main keyboard or numpad), or Ctrl + mouse wheel |
 | Fit on screen | Ctrl+0 |
 | Actual size (100%, one image pixel per screen pixel) | Ctrl+1 |
 | Pan | Mouse wheel (Shift + wheel for sideways), Space + drag, or middle-button drag |
+
+The window title shows `*` before the file name while there are unsaved changes. Opening another image or closing the window with unsaved changes asks whether to save first (Yes / No / Cancel).
+
+## Saving
+
+- **Formats:** PNG and JPEG. In Save As, the file name's extension decides the format (`.png`, `.jpg` or `.jpeg`); a name without one gets the current format's extension, and any other extension is refused rather than saved under a misleading name.
+- **The original is never put at risk:** Moxo writes a temporary file next to the destination, makes sure it reached the disk, then renames it over the original in one step. If anything fails (a read-only or locked file, a missing folder, a full disk), the original stays exactly as it was and the temporary file is removed.
+- **Saving runs in the background.** Edits made while a save is running aren't included in that save, and the image stays marked as unsaved.
+- **JPEG:** saved at quality 90. JPEG has no transparency, so transparent areas are blended onto white.
+- **What saving loses, and when Moxo warns:** Moxo edits in 8 bits per channel and doesn't write colour profiles. Before overwriting a file it opened as a 16-bit PNG or with an embedded colour profile, and before saving a transparent image as JPEG, it asks first. It doesn't keep (or warn about) other metadata, such as EXIF camera details, text chunks or gamma information. Phone-photo rotation is applied to the pixels when opening, so saved images are upright without it.
 
 ## Building on Windows
 
@@ -48,12 +62,14 @@ Release builds compile GPUI's DirectX shaders ahead of time using `fxc.exe` from
 
 ## Project structure
 
-- `src/main.rs`: app state, menus, shortcuts and window chrome (menu bar, empty state, error message, status bar).
+- `src/main.rs`: app state, menus, shortcuts, the open/save/close flows and window chrome (menu bar, empty state, error message, status bar).
+- `src/document.rs`: the open document: editable RGBA pixels, file path and format, unsaved-changes tracking, rotate/flip and their undo/redo. No GPUI types.
+- `src/save.rs`: choosing the output format, PNG/JPEG encoding, and the safe write-then-rename.
 - `src/viewport.rs`: zoom, pan, fit and clamping maths, in physical screen pixels. 100% means one image pixel per physical screen pixel at any Windows display scaling.
 - `src/navigation.rs`: turns mouse wheel, touchpad and drag input into pan and zoom.
 - `src/canvas.rs`: canvas coordinates, pixel-snapped image placement, the transparency checkerboard, and painting.
-- `src/image_loader.rs`: decodes PNG and JPEG off the UI thread.
-- `src/file_dialog.rs`: the native Open dialog.
+- `src/image_loader.rs`: decodes PNG and JPEG off the UI thread into editable pixels.
+- `src/file_dialog.rs`: the native Open and Save As dialogs and the save/discard prompts.
 
 Logic lives in plain functions where possible, so it can be unit-tested without opening a window.
 
@@ -70,7 +86,7 @@ Things to know about GPUI 0.2.2 on Windows:
 
 ## Testing
 
-`cargo test` runs unit tests that never open a window. They cover the viewport maths, input handling, canvas geometry, image decoding, the file dialog's file types, and error messages. The window flow itself (opening, menus, keyboard and drag state) is checked by hand in the running app.
+`cargo test` runs unit tests that never open a window. They cover the viewport maths, input handling, canvas geometry, image decoding, the document's edits, undo/redo and unsaved-changes tracking, saving (formats, transparency, and failures that must leave the original untouched), the file dialog's file types, and error messages. The window flow itself (menus, dialogs, prompts, keyboard and drag state) is checked by hand in the running app.
 
 ## Product name
 

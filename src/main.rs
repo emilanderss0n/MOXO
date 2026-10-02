@@ -2,11 +2,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod canvas;
+mod document;
 mod file_dialog;
 mod image_loader;
 mod navigation;
+mod save;
 mod viewport;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::{
@@ -17,7 +20,10 @@ use gpui::{
     px, rgb, size,
 };
 
+use document::{Document, Transform};
+use file_dialog::SaveChoice;
 use navigation::{PanDrag, ScrollAction};
+use save::FileFormat;
 use viewport::Viewport;
 
 // The product's display name, shown in window titles and messages. It's
@@ -25,7 +31,24 @@ use viewport::Viewport;
 // individual strings. (Technical names like the Cargo package stay as they are.)
 const APP_NAME: &str = "Moxo";
 
-actions!(moxo, [OpenImage, ZoomIn, ZoomOut, FitOnScreen, ActualSize]);
+actions!(
+    moxo,
+    [
+        OpenImage,
+        Save,
+        SaveAs,
+        Undo,
+        Redo,
+        RotateClockwise,
+        RotateCounterClockwise,
+        FlipHorizontal,
+        FlipVertical,
+        ZoomIn,
+        ZoomOut,
+        FitOnScreen,
+        ActualSize
+    ]
+);
 
 // Colours for the dark theme.
 const CHROME_BG: u32 = 0x262626; // menu bar, status bar
@@ -60,18 +83,43 @@ fn open_error_message(file_name: &str, reason: &str) -> String {
     format!("Couldn't open {file_name}: {reason}.")
 }
 
-// The image currently on screen.
+// The same for saving; `reason` comes from `save.rs`, also without a full stop.
+fn save_error_message(file_name: &str, reason: &str) -> String {
+    format!("Couldn't save {file_name}: {reason}.")
+}
+
+// "photo.png - Moxo", with a leading * while there are unsaved changes (the
+// usual Windows convention, as in Notepad).
+fn window_title(file_name: &str, unsaved: bool) -> String {
+    let marker = if unsaved { "*" } else { "" };
+    format!("{marker}{file_name} - {APP_NAME}")
+}
+
+// The open document, plus how it's shown: GPUI's copy of the pixels and the
+// zoom and pan. The document itself knows nothing about either.
 struct OpenedImage {
-    file_name: SharedString,
-    image: Arc<RenderImage>,
-    width: u32,
-    height: u32,
+    // Tells documents apart, so a save that finishes after another image was
+    // opened can't mark the new one as saved.
+    id: u64,
+    document: Document,
+    display: Arc<RenderImage>,
     viewport: Viewport,
+}
+
+// What a running save needs to record its result.
+struct PendingSave {
+    document_id: u64,
+    state: u64,
+    path: PathBuf,
+    format: FileFormat,
+    file_name: String,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum Menu {
     File,
+    Edit,
+    Image,
     View,
 }
 
@@ -96,6 +144,13 @@ struct Moxo {
     pan_drag: PanDrag,
     // The checkerboard tile, and the display scale it was made for.
     checker: Option<(f32, Arc<RenderImage>)>,
+    next_document_id: u64,
+    // Only one save runs at a time, and opening another image waits for it.
+    saving: bool,
+    // The window was asked to close while a save was running.
+    close_after_save: bool,
+    // The user already chose to close, so the next close request goes through.
+    close_confirmed: bool,
 }
 
 impl Moxo {
@@ -111,6 +166,14 @@ impl Moxo {
         })
         .detach();
 
+        // The X button, Alt+F4 and closing from the taskbar all ask this first;
+        // answering `false` keeps the window open.
+        let this = cx.weak_entity();
+        window.on_window_should_close(cx, move |window, cx| {
+            this.update(cx, |this, cx| this.should_close(window, cx))
+                .unwrap_or(true)
+        });
+
         Self {
             focus_handle: cx.focus_handle(),
             open_menu: None,
@@ -121,16 +184,56 @@ impl Moxo {
             space_held: false,
             pan_drag: PanDrag::default(),
             checker: None,
+            next_document_id: 0,
+            saving: false,
+            close_after_save: false,
+            close_confirmed: false,
         }
     }
 
     fn open_image(&mut self, _: &OpenImage, window: &mut Window, cx: &mut Context<Self>) {
         self.open_menu = None;
         cx.notify();
+        // Replacing `open_task` mid-save would cancel the save, so wait for it.
+        if self.saving {
+            return;
+        }
 
-        let picked_file = file_dialog::pick_image(window);
+        let ask_first = self
+            .opened
+            .as_ref()
+            .filter(|opened| opened.document.has_unsaved_changes())
+            .map(|opened| {
+                file_dialog::ask_to_save_changes(
+                    window,
+                    &opened.document.file_name(),
+                    "before opening another image",
+                )
+            });
 
         self.open_task = Some(cx.spawn_in(window, async move |this, cx| {
+            if let Some(answer) = ask_first {
+                match answer.await {
+                    SaveChoice::Cancel => return,
+                    SaveChoice::Discard => {}
+                    SaveChoice::Save => {
+                        let Ok(saving) = this
+                            .update_in(cx, |this, window, cx| this.start_save(None, window, cx))
+                        else {
+                            return;
+                        };
+                        if !saving.await {
+                            return;
+                        }
+                    }
+                }
+            }
+
+            let Ok(picked_file) =
+                this.update_in(cx, |_, window, _| file_dialog::pick_image(window))
+            else {
+                return;
+            };
             // `None` means the user cancelled the dialog: keep everything as it was.
             let Some(file) = picked_file.await else {
                 return;
@@ -145,9 +248,10 @@ impl Moxo {
             .ok();
 
             // Decoding a big photo can take a moment, so do it off the UI thread.
+            let load_path = path.clone();
             let result = cx
                 .background_executor()
-                .spawn(async move { image_loader::load(&path) })
+                .spawn(async move { image_loader::load(&load_path) })
                 .await;
 
             this.update_in(cx, |this, window, cx| {
@@ -156,17 +260,19 @@ impl Moxo {
                     Ok(loaded) => {
                         // Free the previous image's GPU memory.
                         if let Some(previous) = this.opened.take() {
-                            cx.drop_image(previous.image, Some(window));
+                            cx.drop_image(previous.display, Some(window));
                         }
-                        window.set_window_title(&format!("{file_name} - {APP_NAME}"));
                         this.error = None;
+                        let document =
+                            Document::new(loaded.pixels, path, loaded.format, loaded.source);
+                        this.next_document_id += 1;
                         this.opened = Some(OpenedImage {
-                            file_name,
-                            image: loaded.image,
-                            width: loaded.width,
-                            height: loaded.height,
-                            viewport: Viewport::new(loaded.width, loaded.height),
+                            id: this.next_document_id,
+                            display: canvas::display_image(document.pixels()),
+                            viewport: Viewport::new(document.width(), document.height()),
+                            document,
                         });
+                        this.update_title(window);
                     }
                     Err(reason) => {
                         this.error = Some(open_error_message(&file_name, &reason).into());
@@ -176,6 +282,320 @@ impl Moxo {
             })
             .ok();
         }));
+    }
+
+    fn save(&mut self, _: &Save, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_menu = None;
+        let unsaved = self
+            .opened
+            .as_ref()
+            .is_some_and(|opened| opened.document.has_unsaved_changes());
+        if unsaved {
+            self.start_save(None, window, cx).detach();
+        }
+        cx.notify();
+    }
+
+    fn save_as(&mut self, _: &SaveAs, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_menu = None;
+        cx.notify();
+        let Some(opened) = &self.opened else {
+            return;
+        };
+        if self.saving {
+            return;
+        }
+        let document = &opened.document;
+        let fallback = document.format();
+        let picked = file_dialog::pick_save_path(window, document.path(), fallback);
+
+        cx.spawn_in(window, async move |this, cx| {
+            let Some(chosen) = picked.await else {
+                return;
+            };
+            match save::resolve_save_path(&chosen, fallback) {
+                Ok(target) => {
+                    if let Ok(saving) = this.update_in(cx, |this, window, cx| {
+                        this.start_save(Some(target), window, cx)
+                    }) {
+                        saving.await;
+                    }
+                }
+                Err(reason) => {
+                    let name = chosen
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    this.update(cx, |this, cx| {
+                        this.error = Some(save_error_message(&name, &reason).into());
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            }
+        })
+        .detach();
+    }
+
+    // Saves the document to `target`, or to its own file. The task resolves to
+    // whether the file was written. The encoding and writing run in the
+    // background; edits made meanwhile aren't included and stay unsaved.
+    fn start_save(
+        &mut self,
+        target: Option<(PathBuf, FileFormat)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<bool> {
+        let Some(opened) = &self.opened else {
+            return Task::ready(false);
+        };
+        if self.saving {
+            return Task::ready(false);
+        }
+        let document = &opened.document;
+        let (path, format) =
+            target.unwrap_or_else(|| (document.path().to_path_buf(), document.format()));
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let losses = document.losses_when_saving(&path, format);
+        let confirm = (!losses.is_empty())
+            .then(|| file_dialog::confirm_information_loss(window, &file_name, &losses));
+        let document_id = opened.id;
+        self.saving = true;
+        cx.notify();
+
+        cx.spawn_in(window, async move |this, cx| {
+            if let Some(confirm) = confirm
+                && !confirm.await
+            {
+                this.update(cx, |this, cx| {
+                    this.saving = false;
+                    cx.notify();
+                })
+                .ok();
+                return false;
+            }
+
+            // Take the pixels and the version number now. Later edits change the
+            // document's own copy, not this one.
+            let snapshot = this
+                .update(cx, |this, _| {
+                    this.opened
+                        .as_ref()
+                        .filter(|opened| opened.id == document_id)
+                        .map(|opened| opened.document.save_snapshot())
+                })
+                .ok()
+                .flatten();
+            let Some(snapshot) = snapshot else {
+                // The document is gone; don't leave saving switched off for good.
+                this.update(cx, |this, cx| {
+                    this.saving = false;
+                    cx.notify();
+                })
+                .ok();
+                return false;
+            };
+
+            let pixels = snapshot.pixels;
+            let write_path = path.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { save::save(&pixels, &write_path, format) })
+                .await;
+
+            let pending = PendingSave {
+                document_id,
+                state: snapshot.state,
+                path,
+                format,
+                file_name,
+            };
+            this.update_in(cx, |this, window, cx| {
+                this.finish_save(pending, result, window, cx)
+            })
+            .unwrap_or(false)
+        })
+    }
+
+    fn finish_save(
+        &mut self,
+        pending: PendingSave,
+        result: Result<(), String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.saving = false;
+        let saved = match result {
+            Ok(()) => {
+                if let Some(opened) = self
+                    .opened
+                    .as_mut()
+                    .filter(|opened| opened.id == pending.document_id)
+                {
+                    // Marks the version that was written as saved. If the image
+                    // was edited meanwhile, it stays marked as unsaved.
+                    opened
+                        .document
+                        .mark_saved(pending.state, pending.path, pending.format);
+                }
+                self.error = None;
+                true
+            }
+            Err(reason) => {
+                self.error = Some(save_error_message(&pending.file_name, &reason).into());
+                false
+            }
+        };
+        self.update_title(window);
+        cx.notify();
+
+        if self.close_after_save {
+            self.close_after_save = false;
+            if saved && self.should_close(window, cx) {
+                self.close_window(window);
+            }
+        }
+        saved
+    }
+
+    // Asked before the window closes. Returning `false` keeps it open; with
+    // unsaved changes, Moxo asks first and closes the window itself afterwards.
+    fn should_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.close_confirmed {
+            return true;
+        }
+        if self.saving {
+            // Let the save finish first; `finish_save` tries again.
+            self.close_after_save = true;
+            return false;
+        }
+        let Some(opened) = self
+            .opened
+            .as_ref()
+            .filter(|opened| opened.document.has_unsaved_changes())
+        else {
+            return true;
+        };
+
+        let answer = file_dialog::ask_to_save_changes(
+            window,
+            &opened.document.file_name(),
+            "before closing",
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let close = match answer.await {
+                SaveChoice::Cancel => false,
+                SaveChoice::Discard => true,
+                SaveChoice::Save => {
+                    match this.update_in(cx, |this, window, cx| this.start_save(None, window, cx)) {
+                        Ok(saving) => saving.await,
+                        Err(_) => false,
+                    }
+                }
+            };
+            if close {
+                this.update_in(cx, |this, window, _| this.close_window(window))
+                    .ok();
+            }
+        })
+        .detach();
+        false
+    }
+
+    fn close_window(&mut self, window: &mut Window) {
+        self.close_confirmed = true;
+        window.remove_window();
+    }
+
+    fn edit(&mut self, transform: Transform, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_menu = None;
+        let Some(opened) = &mut self.opened else {
+            return;
+        };
+        opened.document.apply(transform);
+        self.show_change(transform, window, cx);
+    }
+
+    fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_menu = None;
+        if let Some(applied) = self
+            .opened
+            .as_mut()
+            .and_then(|opened| opened.document.undo())
+        {
+            self.show_change(applied, window, cx);
+        }
+        cx.notify();
+    }
+
+    fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_menu = None;
+        if let Some(applied) = self
+            .opened
+            .as_mut()
+            .and_then(|opened| opened.document.redo())
+        {
+            self.show_change(applied, window, cx);
+        }
+        cx.notify();
+    }
+
+    // Refreshes GPUI's copy after the document's pixels changed. A rotation
+    // changes the proportions, so the view is refitted; flips keep zoom and pan.
+    fn show_change(&mut self, applied: Transform, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(opened) = &mut self.opened else {
+            return;
+        };
+        let previous = std::mem::replace(
+            &mut opened.display,
+            canvas::display_image(opened.document.pixels()),
+        );
+        cx.drop_image(previous, Some(window));
+        if applied.changes_size() {
+            opened.viewport = Viewport::new(opened.document.width(), opened.document.height());
+        }
+        self.update_title(window);
+        cx.notify();
+    }
+
+    fn rotate_clockwise(
+        &mut self,
+        _: &RotateClockwise,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.edit(Transform::RotateClockwise, window, cx);
+    }
+
+    fn rotate_counter_clockwise(
+        &mut self,
+        _: &RotateCounterClockwise,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.edit(Transform::RotateCounterClockwise, window, cx);
+    }
+
+    fn flip_horizontal(&mut self, _: &FlipHorizontal, window: &mut Window, cx: &mut Context<Self>) {
+        self.edit(Transform::FlipHorizontal, window, cx);
+    }
+
+    fn flip_vertical(&mut self, _: &FlipVertical, window: &mut Window, cx: &mut Context<Self>) {
+        self.edit(Transform::FlipVertical, window, cx);
+    }
+
+    fn update_title(&self, window: &mut Window) {
+        let title = match &self.opened {
+            Some(opened) => window_title(
+                &opened.document.file_name(),
+                opened.document.has_unsaved_changes(),
+            ),
+            None => APP_NAME.to_string(),
+        };
+        window.set_window_title(&title);
     }
 
     // Runs a change on the open image's viewport, if there is one.
@@ -288,6 +708,10 @@ impl Moxo {
 
     fn menu_items(&self, menu: Menu) -> Vec<MenuItem> {
         let has_image = self.opened.is_some();
+        let document = self.opened.as_ref().map(|opened| &opened.document);
+        let unsaved = document.is_some_and(Document::has_unsaved_changes);
+        let can_undo = document.is_some_and(Document::can_undo);
+        let can_redo = document.is_some_and(Document::can_redo);
         let item = |label, shortcut, action: Box<dyn Action>, enabled| MenuItem {
             label,
             shortcut,
@@ -295,7 +719,36 @@ impl Moxo {
             enabled,
         };
         match menu {
-            Menu::File => vec![item("Open Image…", "Ctrl+O", Box::new(OpenImage), true)],
+            Menu::File => vec![
+                item("Open Image…", "Ctrl+O", Box::new(OpenImage), !self.saving),
+                item("Save", "Ctrl+S", Box::new(Save), unsaved && !self.saving),
+                item(
+                    "Save As…",
+                    "Ctrl+Shift+S",
+                    Box::new(SaveAs),
+                    has_image && !self.saving,
+                ),
+            ],
+            Menu::Edit => vec![
+                item("Undo", "Ctrl+Z", Box::new(Undo), can_undo),
+                item("Redo", "Ctrl+Y", Box::new(Redo), can_redo),
+            ],
+            Menu::Image => vec![
+                item(
+                    "Rotate 90° Clockwise",
+                    "",
+                    Box::new(RotateClockwise),
+                    has_image,
+                ),
+                item(
+                    "Rotate 90° Counter-clockwise",
+                    "",
+                    Box::new(RotateCounterClockwise),
+                    has_image,
+                ),
+                item("Flip Horizontal", "", Box::new(FlipHorizontal), has_image),
+                item("Flip Vertical", "", Box::new(FlipVertical), has_image),
+            ],
             Menu::View => vec![
                 item("Zoom In", "Ctrl++", Box::new(ZoomIn), has_image),
                 item("Zoom Out", "Ctrl+-", Box::new(ZoomOut), has_image),
@@ -314,6 +767,8 @@ impl Moxo {
             .items_center()
             .bg(rgb(CHROME_BG))
             .child(self.render_menu(Menu::File, "File", cx))
+            .child(self.render_menu(Menu::Edit, "Edit", cx))
+            .child(self.render_menu(Menu::Image, "Image", cx))
             .child(self.render_menu(Menu::View, "View", cx))
     }
 
@@ -410,7 +865,7 @@ impl Moxo {
         let content = match (&self.opened, &self.checker) {
             (Some(opened), Some((_, checker))) => {
                 let viewport = opened.viewport;
-                let image = opened.image.clone();
+                let image = opened.display.clone();
                 let checker = checker.clone();
                 let dragging = self.pan_drag.is_active();
                 let this = cx.weak_entity();
@@ -556,7 +1011,10 @@ impl Moxo {
     fn render_status_bar(&self, window: &Window) -> impl IntoElement {
         let file_label = match (&self.loading, &self.opened) {
             (Some(loading), _) => format!("Opening {loading}…"),
-            (None, Some(opened)) => opened.file_name.to_string(),
+            (None, Some(opened)) if self.saving => {
+                format!("Saving {}…", opened.document.file_name())
+            }
+            (None, Some(opened)) => opened.document.file_name(),
             (None, None) => String::new(),
         };
 
@@ -579,7 +1037,11 @@ impl Moxo {
                         .flex()
                         .gap_4()
                         .child(viewport::zoom_label(zoom))
-                        .child(format!("{} × {} px", opened.width, opened.height)),
+                        .child(format!(
+                            "{} × {} px",
+                            opened.document.width(),
+                            opened.document.height()
+                        )),
                 )
             })
     }
@@ -592,6 +1054,14 @@ impl Render for Moxo {
         div()
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::open_image))
+            .on_action(cx.listener(Self::save))
+            .on_action(cx.listener(Self::save_as))
+            .on_action(cx.listener(Self::undo))
+            .on_action(cx.listener(Self::redo))
+            .on_action(cx.listener(Self::rotate_clockwise))
+            .on_action(cx.listener(Self::rotate_counter_clockwise))
+            .on_action(cx.listener(Self::flip_horizontal))
+            .on_action(cx.listener(Self::flip_vertical))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::fit_on_screen))
@@ -614,6 +1084,11 @@ fn main() {
     Application::new().run(|cx: &mut App| {
         cx.bind_keys([
             KeyBinding::new("ctrl-o", OpenImage, None),
+            KeyBinding::new("ctrl-s", Save, None),
+            KeyBinding::new("ctrl-shift-s", SaveAs, None),
+            KeyBinding::new("ctrl-z", Undo, None),
+            KeyBinding::new("ctrl-y", Redo, None),
+            KeyBinding::new("ctrl-shift-z", Redo, None),
             KeyBinding::new("ctrl-=", ZoomIn, None),
             KeyBinding::new("ctrl-+", ZoomIn, None),
             KeyBinding::new("ctrl--", ZoomOut, None),
@@ -722,6 +1197,48 @@ mod tests {
             assert_eq!(
                 open_error_message(file_name, reason),
                 format!("Couldn't open {file_name}: {reason}.")
+            );
+        }
+    }
+
+    #[test]
+    fn the_title_marks_unsaved_changes_and_uses_the_app_name() {
+        assert_eq!(
+            window_title("photo.png", false),
+            format!("photo.png - {APP_NAME}")
+        );
+        assert_eq!(
+            window_title("photo.png", true),
+            format!("*photo.png - {APP_NAME}")
+        );
+    }
+
+    // Real save failures must read as one sentence with exactly one full stop.
+    #[test]
+    fn real_save_errors_read_as_one_sentence() {
+        let missing_folder = std::env::temp_dir()
+            .join(format!("moxo-main-no-such-folder-{}", std::process::id()))
+            .join("photo.png");
+        let reasons = [
+            save::save(
+                &image::RgbaImage::new(1, 1),
+                &missing_folder,
+                FileFormat::Png,
+            )
+            .unwrap_err(),
+            save::resolve_save_path(std::path::Path::new("photo.gif"), FileFormat::Png)
+                .unwrap_err(),
+        ];
+        for reason in reasons {
+            let message = save_error_message("photo.png", &reason);
+            assert!(
+                message.starts_with("Couldn't save photo.png: "),
+                "{message}"
+            );
+            assert!(message.contains(&reason), "{message}");
+            assert!(
+                message.ends_with('.') && !message.ends_with(".."),
+                "{message}"
             );
         }
     }

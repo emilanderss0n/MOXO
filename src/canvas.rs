@@ -102,6 +102,20 @@ pub fn checker_tile(scale: f32) -> Arc<RenderImage> {
     Arc::new(RenderImage::new([Frame::new(checker_pixels(scale))]))
 }
 
+// GPUI's copy of the document for drawing. GPUI wants blue-green-red-alpha
+// order, so this swaps red and blue in a copy; the document keeps its RGBA.
+pub fn display_image(pixels: &RgbaImage) -> Arc<RenderImage> {
+    Arc::new(RenderImage::new([Frame::new(bgra_copy(pixels))]))
+}
+
+fn bgra_copy(pixels: &RgbaImage) -> RgbaImage {
+    let mut copy = pixels.clone();
+    for pixel in copy.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    copy
+}
+
 pub fn paint(
     canvas: Bounds<Pixels>,
     viewport: &Viewport,
@@ -327,6 +341,22 @@ mod tests {
         let tile = checker_pixels(1.0);
         let side = tile.width();
         assert_ne!(tile.get_pixel(side - 1, 0), tile.get_pixel(0, 0));
+    }
+
+    #[test]
+    fn the_display_copy_is_bgra_and_leaves_the_document_alone() {
+        let mut pixels = RgbaImage::new(2, 1);
+        pixels.put_pixel(0, 0, Rgba([10, 20, 30, 255]));
+        pixels.put_pixel(1, 0, Rgba([200, 150, 100, 0]));
+        let original = pixels.clone();
+
+        let copy = bgra_copy(&pixels);
+        assert_eq!(copy.dimensions(), (2, 1));
+        // Red and blue swap places; green and alpha (including full
+        // transparency) stay put.
+        assert_eq!(copy.get_pixel(0, 0).0, [30, 20, 10, 255]);
+        assert_eq!(copy.get_pixel(1, 0).0, [100, 150, 200, 0]);
+        assert_eq!(pixels, original);
     }
 
     #[test]

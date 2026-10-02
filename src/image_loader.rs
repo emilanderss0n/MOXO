@@ -1,21 +1,23 @@
-// Reads an image file from disk and turns it into something GPUI can draw.
+// Reads an image file from disk into editable RGBA pixels, and notes what the
+// file holds that Moxo can't keep.
 
 use std::io::ErrorKind;
 use std::path::Path;
-use std::sync::Arc;
 
-use gpui::RenderImage;
-use image::{DynamicImage, Frame, ImageDecoder, ImageError, ImageFormat, ImageReader};
+use image::{DynamicImage, ImageDecoder, ImageError, ImageReader, RgbaImage};
 
 use crate::APP_NAME;
+use crate::document::SourceDetails;
+use crate::save::FileFormat;
 
 // GPUI can't upload an image larger than this on either side to the GPU.
 const MAX_SIDE: u32 = 16384;
 
 pub struct LoadedImage {
-    pub image: Arc<RenderImage>,
-    pub width: u32,
-    pub height: u32,
+    // 8 bits per channel, red-green-blue-alpha, upright.
+    pub pixels: RgbaImage,
+    pub format: FileFormat,
+    pub source: SourceDetails,
 }
 
 // Errors are returned as plain text because they go straight into the UI.
@@ -25,9 +27,9 @@ pub fn load(path: &Path) -> Result<LoadedImage, String> {
         .and_then(|reader| reader.with_guessed_format())
         .map_err(|error| format!("the file couldn't be read ({error})"))?;
 
-    if !matches!(reader.format(), Some(ImageFormat::Png | ImageFormat::Jpeg)) {
+    let Some(format) = reader.format().and_then(FileFormat::from_image_format) else {
         return Err("it isn't a PNG or JPEG file".into());
-    }
+    };
 
     // The image crate refuses images over 512 MB by default. We do our own size check below.
     reader.no_limits();
@@ -40,23 +42,23 @@ pub fn load(path: &Path) -> Result<LoadedImage, String> {
         ));
     }
 
+    // Record what saving over this file would lose: Moxo edits in 8 bits per
+    // channel and doesn't write colour profiles.
+    let colour_type = decoder.color_type();
+    let source = SourceDetails {
+        high_bit_depth: colour_type.bytes_per_pixel() > colour_type.channel_count(),
+        colour_profile: decoder.icc_profile().map_err(describe)?.is_some(),
+    };
+
     // Phone photos often store "rotate this" in the file instead of rotating the pixels.
     let orientation = decoder.orientation().map_err(describe)?;
     let mut decoded = DynamicImage::from_decoder(decoder).map_err(describe)?;
     decoded.apply_orientation(orientation);
 
-    let mut pixels = decoded.into_rgba8();
-    let (width, height) = pixels.dimensions();
-
-    // GPUI expects pixels in BGRA order; the decoder gives RGBA.
-    for pixel in pixels.chunks_exact_mut(4) {
-        pixel.swap(0, 2);
-    }
-
     Ok(LoadedImage {
-        image: Arc::new(RenderImage::new([Frame::new(pixels)])),
-        width,
-        height,
+        pixels: decoded.into_rgba8(),
+        format,
+        source,
     })
 }
 
@@ -74,7 +76,7 @@ fn describe(error: ImageError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{ImageBuffer, Luma, Rgb, RgbImage, Rgba, RgbaImage};
+    use image::{ImageBuffer, ImageFormat, Luma, Rgb, RgbImage, Rgba, RgbaImage};
     use std::fs;
     use std::path::PathBuf;
 
@@ -98,11 +100,9 @@ mod tests {
         }
     }
 
-    // The loaded pixel at (x, y), as stored for GPUI: blue, green, red, alpha.
-    fn bgra_at(loaded: &LoadedImage, x: u32, y: u32) -> [u8; 4] {
-        let bytes = loaded.image.as_bytes(0).unwrap();
-        let start = ((y * loaded.width + x) * 4) as usize;
-        bytes[start..start + 4].try_into().unwrap()
+    // The loaded pixel at (x, y): red, green, blue, alpha.
+    fn rgba_at(loaded: &LoadedImage, x: u32, y: u32) -> [u8; 4] {
+        loaded.pixels.get_pixel(x, y).0
     }
 
     // JPEG is lossy, so its colours come back slightly different.
@@ -119,14 +119,15 @@ mod tests {
         match load(path) {
             Ok(loaded) => panic!(
                 "expected an error, got a {}x{} image",
-                loaded.width, loaded.height
+                loaded.pixels.width(),
+                loaded.pixels.height()
             ),
             Err(message) => message,
         }
     }
 
     #[test]
-    fn a_png_loads_with_its_size_and_pixels_in_bgra_order() {
+    fn a_png_loads_with_its_size_and_exact_pixels() {
         let file = TempFile::new("colours.png");
         let mut png = RgbaImage::new(3, 2);
         png.put_pixel(0, 0, Rgba([10, 20, 30, 255]));
@@ -134,11 +135,9 @@ mod tests {
         png.save(&file.0).unwrap();
 
         let loaded = load(&file.0).unwrap();
-        assert_eq!((loaded.width, loaded.height), (3, 2));
-        assert_eq!(loaded.image.size(0).width.0, 3);
-        // Red and blue swap places; green and alpha stay put.
-        assert_eq!(bgra_at(&loaded, 0, 0), [30, 20, 10, 255]);
-        assert_eq!(bgra_at(&loaded, 2, 1), [100, 150, 200, 255]);
+        assert_eq!(loaded.pixels.dimensions(), (3, 2));
+        assert_eq!(rgba_at(&loaded, 0, 0), [10, 20, 30, 255]);
+        assert_eq!(rgba_at(&loaded, 2, 1), [200, 150, 100, 255]);
     }
 
     #[test]
@@ -150,8 +149,8 @@ mod tests {
         png.save(&file.0).unwrap();
 
         let loaded = load(&file.0).unwrap();
-        assert_eq!(bgra_at(&loaded, 0, 0)[3], 0);
-        assert_eq!(bgra_at(&loaded, 1, 0), [0, 255, 0, 128]);
+        assert_eq!(rgba_at(&loaded, 0, 0)[3], 0);
+        assert_eq!(rgba_at(&loaded, 1, 0), [0, 255, 0, 128]);
     }
 
     #[test]
@@ -162,9 +161,9 @@ mod tests {
             .unwrap();
 
         let loaded = load(&file.0).unwrap();
-        assert_eq!((loaded.width, loaded.height), (40, 30));
+        assert_eq!(loaded.pixels.dimensions(), (40, 30));
         // JPEGs have no transparency, so alpha is always fully opaque.
-        assert_colour_close(bgra_at(&loaded, 20, 15), [50, 100, 200, 255]);
+        assert_colour_close(rgba_at(&loaded, 20, 15), [200, 100, 50, 255]);
     }
 
     #[test]
@@ -176,7 +175,7 @@ mod tests {
 
         let loaded = load(&file.0).unwrap();
         // Exact colours prove it was read as a lossless PNG, not a JPEG.
-        assert_eq!(bgra_at(&loaded, 0, 0), [3, 2, 1, 255]);
+        assert_eq!(rgba_at(&loaded, 0, 0), [1, 2, 3, 255]);
     }
 
     #[test]
@@ -187,7 +186,7 @@ mod tests {
             .unwrap();
 
         let loaded = load(&file.0).unwrap();
-        assert_eq!(bgra_at(&loaded, 1, 1), [77, 77, 77, 255]);
+        assert_eq!(rgba_at(&loaded, 1, 1), [77, 77, 77, 255]);
     }
 
     #[test]
@@ -198,7 +197,7 @@ mod tests {
             .unwrap();
 
         let loaded = load(&file.0).unwrap();
-        assert_eq!(bgra_at(&loaded, 0, 0), [0, 128, 255, 255]);
+        assert_eq!(rgba_at(&loaded, 0, 0), [255, 128, 0, 255]);
     }
 
     // Builds a JPEG whose EXIF data says "rotate 90° clockwise to display",
@@ -242,16 +241,16 @@ mod tests {
         let loaded = load(&file.0).unwrap();
         // Turned a quarter clockwise: now 16 wide and 32 tall, with the red
         // (formerly left) half on top and the blue half below.
-        assert_eq!((loaded.width, loaded.height), (16, 32));
-        assert_colour_close(bgra_at(&loaded, 8, 4), [0, 0, 255, 255]);
-        assert_colour_close(bgra_at(&loaded, 8, 27), [255, 0, 0, 255]);
+        assert_eq!(loaded.pixels.dimensions(), (16, 32));
+        assert_colour_close(rgba_at(&loaded, 8, 4), [255, 0, 0, 255]);
+        assert_colour_close(rgba_at(&loaded, 8, 27), [0, 0, 255, 255]);
     }
 
     #[test]
     fn images_up_to_the_size_limit_load() {
         let file = TempFile::new("widest.png");
         RgbaImage::new(MAX_SIDE, 1).save(&file.0).unwrap();
-        assert_eq!(load(&file.0).unwrap().width, MAX_SIDE);
+        assert_eq!(load(&file.0).unwrap().pixels.width(), MAX_SIDE);
     }
 
     #[test]
@@ -319,5 +318,61 @@ mod tests {
         // The window adds its own full stop after "Couldn't open <file>: <reason>".
         let file = TempFile::new("does-not-exist-either.png");
         assert!(!load_error(&file.0).ends_with('.'));
+    }
+
+    #[test]
+    fn the_format_is_recorded_for_saving() {
+        let png = TempFile::new("format.png");
+        RgbaImage::new(2, 2).save(&png.0).unwrap();
+        assert_eq!(load(&png.0).unwrap().format, FileFormat::Png);
+
+        let jpeg = TempFile::new("format.jpg");
+        RgbImage::new(2, 2).save(&jpeg.0).unwrap();
+        assert_eq!(load(&jpeg.0).unwrap().format, FileFormat::Jpeg);
+
+        // The contents decide, not the name.
+        let disguised = TempFile::new("disguised.jpg");
+        RgbaImage::new(2, 2)
+            .save_with_format(&disguised.0, ImageFormat::Png)
+            .unwrap();
+        assert_eq!(load(&disguised.0).unwrap().format, FileFormat::Png);
+    }
+
+    #[test]
+    fn an_ordinary_8_bit_image_has_nothing_that_saving_would_lose() {
+        let file = TempFile::new("plain.png");
+        RgbaImage::new(2, 2).save(&file.0).unwrap();
+        assert_eq!(load(&file.0).unwrap().source, SourceDetails::default());
+    }
+
+    #[test]
+    fn a_16_bit_png_is_flagged() {
+        let file = TempFile::new("sixteen.png");
+        ImageBuffer::<Rgba<u16>, _>::new(2, 2)
+            .save(&file.0)
+            .unwrap();
+        let source = load(&file.0).unwrap().source;
+        assert!(source.high_bit_depth);
+        assert!(!source.colour_profile);
+    }
+
+    #[test]
+    fn an_embedded_colour_profile_is_flagged() {
+        use image::ImageEncoder;
+        use image::codecs::png::PngEncoder;
+
+        let mut bytes = Vec::new();
+        let mut encoder = PngEncoder::new(&mut bytes);
+        // Moxo only checks whether a profile is present, not what's in it.
+        encoder.set_icc_profile(vec![0; 128]).unwrap();
+        encoder
+            .write_image(&[0; 16], 2, 2, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        let file = TempFile::new("profile.png");
+        fs::write(&file.0, bytes).unwrap();
+
+        let source = load(&file.0).unwrap().source;
+        assert!(source.colour_profile);
+        assert!(!source.high_bit_depth);
     }
 }
