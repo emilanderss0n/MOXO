@@ -53,9 +53,9 @@ Clippy currently reports one known warning (`manual_is_multiple_of` in
 - Never control the mouse or keyboard, and don't launch the app (`cargo run`
   or the built `moxo.exe`) without asking first.
 - Test logic with unit tests. Covered today: viewport maths, coordinate
-  conversion, input handling and the checkerboard (`viewport.rs`,
-  `navigation.rs`, `canvas.rs`). Not yet tested: `image_loader.rs`,
-  `file_dialog.rs` and the app flow in `main.rs`.
+  conversion, input handling, the checkerboard and image decoding
+  (`viewport.rs`, `navigation.rs`, `canvas.rs`, `image_loader.rs`). Not yet
+  tested: `file_dialog.rs` and the app flow in `main.rs`.
 - Never weaken or remove tests to avoid GUI automation; replace GUI-dependent
   tests with meaningful non-GUI tests where practical.
 - Every bug fix gets a regression test.
