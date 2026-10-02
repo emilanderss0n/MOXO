@@ -2,7 +2,17 @@
 
 A lightweight, offline-first image editor for Windows, written in Rust with [GPUI](https://www.gpui.rs/).
 
-Early days: right now it can open and view PNG and JPEG images (File › Open Image…, or Ctrl+O).
+Early days: right now it can open PNG and JPEG images and zoom and pan around them.
+
+## Controls
+
+| Action | Shortcut |
+|---|---|
+| Open an image | Ctrl+O |
+| Zoom in / out | Ctrl++ / Ctrl+- (main keyboard or numpad), or Ctrl + mouse wheel |
+| Fit on screen | Ctrl+0 |
+| Actual size (100%, one image pixel per screen pixel) | Ctrl+1 |
+| Pan | Mouse wheel (Shift + wheel for sideways), Space + drag, or middle-button drag |
 
 ## Building on Windows
 
@@ -16,7 +26,10 @@ Then:
 ```
 cargo run              # debug build
 cargo run --release    # optimised build
+cargo test             # unit tests
 ```
+
+The **first debug build takes a few minutes** (about 3 on the original development machine). `Cargo.toml` tells Cargo to fully optimise the libraries Moxo uses even in debug builds, because unoptimised image decoding is far too slow to work with (a 48-megapixel photo took 17 seconds to open instead of under half a second). Those libraries are only compiled once, so later debug builds are quick.
 
 ### Release builds and fxc.exe
 
