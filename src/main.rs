@@ -54,6 +54,12 @@ fn canvas_area(window: &Window) -> Size<f32> {
     canvas::area_in_screen_pixels(canvas_bounds(window), window.scale_factor())
 }
 
+// The message shown when a file can't be opened. `reason` comes from the image
+// loader, which leaves off the full stop so this sentence can add it.
+fn open_error_message(file_name: &str, reason: &str) -> String {
+    format!("Couldn't open {file_name}: {reason}.")
+}
+
 // The image currently on screen.
 struct OpenedImage {
     file_name: SharedString,
@@ -163,7 +169,7 @@ impl Moxo {
                         });
                     }
                     Err(reason) => {
-                        this.error = Some(format!("Couldn't open {file_name}: {reason}.").into());
+                        this.error = Some(open_error_message(&file_name, &reason).into());
                     }
                 }
                 cx.notify();
@@ -637,4 +643,86 @@ fn main() {
 
         cx.activate(true);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    // A file in a temporary folder, deleted when the test ends (even if it fails).
+    struct TempFile(PathBuf);
+
+    impl TempFile {
+        fn new(name: &str) -> Self {
+            let folder =
+                std::env::temp_dir().join(format!("moxo-main-tests-{}", std::process::id()));
+            fs::create_dir_all(&folder).unwrap();
+            Self(folder.join(name))
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    // The reason the real image loader gives for this file.
+    fn loader_reason(file: &TempFile) -> String {
+        match image_loader::load(&file.0) {
+            Ok(_) => panic!("expected {} to fail to load", file.0.display()),
+            Err(reason) => reason,
+        }
+    }
+
+    #[test]
+    fn open_error_message_wording() {
+        assert_eq!(
+            open_error_message("photo.png", "the file is incomplete or damaged"),
+            "Couldn't open photo.png: the file is incomplete or damaged."
+        );
+    }
+
+    // Real loader errors must come out as one sentence with exactly one full
+    // stop. An early version showed "Invalid PNG signature.." because both the
+    // loader and this message added one.
+    #[test]
+    fn real_loader_errors_read_as_one_sentence() {
+        let missing = TempFile::new("missing.png");
+
+        let not_an_image = TempFile::new("not an image.png");
+        fs::write(&not_an_image.0, "just text").unwrap();
+
+        let too_wide = TempFile::new("too wide.png");
+        image::RgbaImage::new(16385, 1).save(&too_wide.0).unwrap();
+
+        for file in [&missing, &not_an_image, &too_wide] {
+            let file_name = file.0.file_name().unwrap().to_str().unwrap();
+            let reason = loader_reason(file);
+            let message = open_error_message(file_name, &reason);
+
+            assert!(
+                message.starts_with(&format!("Couldn't open {file_name}: ")),
+                "{message}"
+            );
+            assert!(message.contains(&reason), "{message}");
+            assert!(
+                message.ends_with('.') && !message.ends_with(".."),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn unusual_file_names_and_reasons_are_kept_exactly() {
+        for file_name in ["my photo.final.v2 – kopia.PNG", "bild_åäö.jpg", ".png"] {
+            let reason = "it's 17000 × 100 px (too wide); try a smaller one";
+            assert_eq!(
+                open_error_message(file_name, reason),
+                format!("Couldn't open {file_name}: {reason}.")
+            );
+        }
+    }
 }
